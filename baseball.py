@@ -28,21 +28,22 @@ def make_fake_phase(_df: pl.LazyFrame, period: float = 26.7) -> pl.LazyFrame:
 
 def make_one_df_range(
     _merged,
-    threshold=5,
+    threshold=7,
     phase=99,
     range_size=1,
     fake_moon_period=None,
     group_by=['Moon Status'],
-    stat='large_victory_flag',
+    stat='large_victory',
 ):
     merged = _merged.lazy()
+    if stat == 'large_victory':  # really should move stat creation out of this function
+        merged = merged.with_columns(large_victory=pl.col('margin_of_victory').ge(threshold))
     if fake_moon_period:
         merged = merged.pipe(make_fake_phase, fake_moon_period)
     return (
         merged
         .with_columns(
             (pl.col('phase').is_between(phase, phase + range_size)).alias('Moon Status'),
-            large_victory_flag=pl.col('margin_of_victory').ge(threshold),
             #  team_quality_large_gap = (pl.col('py_win')-pl.col('py_win_home')).abs().gt(.10)
         )
         .group_by(group_by, maintain_order=True)
@@ -51,7 +52,7 @@ def make_one_df_range(
             pl.col('phase').mean(),
             pl.col('gid').count().alias('count'),
             pl.col(stat).sum().alias(f'{stat}_count'),
-            pl.col('daynight').eq('day').mean().alias('day_game_flag'),
+            #    pl.col('daynight').eq('day').mean().alias('day_game_flag'),
         )
         .with_columns(blowout_threshold=threshold)
         .collect()
@@ -60,32 +61,68 @@ def make_one_df_range(
     )
 
 
-def make_phase_bin_data(merged, threshold=7, fake_moon_period=None, phase_range=range(100)):
+def clean_name(x):
+    return x.replace('_', ' ').title()
+
+
+def find_col(obj, pattern, regex=False):
+    r"""Simple match column/key names in a dataframe/dictionary, optional regex. Without regex
+    does as simple "s in col_name"
+
+    usage:
+
+    find_col(_df,'appraisal')
+
+    or
+
+    find_col(_df,'\w+_\w+',regex=True)
+
+    """
+    pattern = str(pattern)
+    if not hasattr(obj, 'columns'):
+        return []
+    if not regex:
+        return sorted([col for col in obj.columns if pattern in str(col)])
+    else:
+        return sorted([col for col in obj.columns if re.match(pattern, str(col))])
+
+
+def make_phase_bin_data(
+    merged,
+    threshold=7,
+    fake_moon_period=None,
+    phase_range=range(100),
+    range_size=1,
+    stat='large_victory',
+):
 
     phase_vs_all = (
         (
             pl.concat([
                 make_one_df_range(
-                    merged, threshold=threshold, phase=phase, fake_moon_period=fake_moon_period
+                    merged,
+                    threshold=threshold,
+                    phase=phase,
+                    range_size=range_size,
+                    fake_moon_period=fake_moon_period,
+                    stat=stat,
                 )
                 for phase in phase_range
-            ]).pivot(
-                on='Moon Status', index='phase_bin', values=['large_victory_rate', 'count']
-            )
+            ]).pivot(on='Moon Status', index='phase_bin', values=[f'{stat}_rate', 'count'])
         )
-        .pipe(pipe_rate_error, 'large_victory_rate_true', 'count_true')
-        .pipe(pipe_rate_error, 'large_victory_rate_false', 'count_false')
+        .pipe(pipe_rate_error, f'{stat}_rate_true', 'count_true')
+        .pipe(pipe_rate_error, f'{stat}_rate_false', 'count_false')
     )
     phase_data_pandas = phase_vs_all.to_pandas()
-    phase_data_pandas['large_victory_rate_in_phase_range'] = phase_data_pandas[
-        ['large_victory_rate_true', 'large_victory_rate_true_error']
+    phase_data_pandas[f'{stat}_rate_in_phase_range'] = phase_data_pandas[
+        [f'{stat}_rate_true', f'{stat}_rate_true_error']
     ].apply(lambda x: ufloat(x.iloc[0], x.iloc[1]), axis=1)
-    phase_data_pandas['large_victory_rate_out_of_phase_range'] = phase_data_pandas[
-        ['large_victory_rate_false', 'large_victory_rate_false_error']
+    phase_data_pandas[f'{stat}_rate_out_of_phase_range'] = phase_data_pandas[
+        [f'{stat}_rate_false', f'{stat}_rate_false_error']
     ].apply(lambda x: ufloat(x.iloc[0], x.iloc[1]), axis=1)
     phase_data_pandas = phase_data_pandas.assign(
-        ratio_ufloat=pd.col('large_victory_rate_in_phase_range')
-        / pd.col('large_victory_rate_out_of_phase_range')
+        ratio_ufloat=pd.col(f'{stat}_rate_in_phase_range')
+        / pd.col(f'{stat}_rate_out_of_phase_range')
     ).assign(
         ratio=pd.col('ratio_ufloat').apply(lambda x: x.n),
         ratio_error=pd.col('ratio_ufloat').apply(lambda x: x.s),
@@ -120,19 +157,26 @@ def get_merged_data():
     return all_data.join(moon_data, how='left', on=['date'])
 
 
-def make_fake_vs_real_full_moons(merged, n=100, threshold=7, group=['Moon Status']):
+def make_fake_vs_real_full_moons(
+    merged, n=100, threshold=7, group=['Moon Status'], stat='large_victory'
+):
     out = []
     for _ in tqdm(range(n)):
         random_period = random.randint(250000, 350000) / 10000
         out.append(
             make_one_df_range(
-                merged, fake_moon_period=random_period, threshold=threshold, group_by=group
+                merged,
+                fake_moon_period=random_period,
+                threshold=threshold,
+                group_by=group,
+                stat=stat,
             )
         )
     out.append(
         make_one_df_range(
             merged,
             group_by=group,
+            stat=stat,
             fake_moon_period=None,
             threshold=7,
         )
@@ -145,7 +189,7 @@ def make_fake_vs_real_full_moons(merged, n=100, threshold=7, group=['Moon Status
             on='Moon Status',
             index=['phase_bin', 'fake_moon_period']
             + (['season'] if 'season' in group else []),
-            values=['large_victory_rate'],
+            values=[f'{stat}_rate'],
             aggregate_function='first',
         )
         .with_columns(full_moon_ratio=pl.col('true') / 'false')
