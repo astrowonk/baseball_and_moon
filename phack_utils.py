@@ -1,9 +1,38 @@
+"""
+gid_stat_sums.parquet  - stat sums by gid
+
+"""
+
 import polars as pl
 
 from baseball import pipe_rate_error
 
 from uncertainties import ufloat
 import json
+
+COLUMNS = [
+    'b_t',
+    'b_hr',
+    'b_pa',
+    'b_d',
+    'd_dp',
+    'p_k',
+    'b_hbp',
+    #    'b_cs',
+    'b_sh',
+    #   'b_sb',
+    'b_gdp',
+    'b_roe',
+    'b_iw',
+    'b_w',
+    'p_wp',
+]
+
+
+def make_gid_lookup_parquet():
+    pl.read_csv('teamstats.csv', infer_schema_length=100000, ignore_errors=True).filter(
+        pl.col('stattype').eq('value')
+    ).group_by('gid').agg(pl.col(COLUMNS).sum()).write_parquet('gid_stat_sums.parquet')
 
 
 def get_stat_map():
@@ -52,7 +81,7 @@ def do_phacking(merged, gid_stat_sums, phase=100):
         .lazy()
         .join(gid_stat_sums.lazy(), on='gid')
         .group_by('season', 'theflag')
-        .agg(pl.col(cols).sum())
+        .agg(pl.col(COLUMNS).sum())
         .collect()
         .sort('season')
         .unpivot(index=['season', 'theflag', 'b_pa'], variable_name='stat')
