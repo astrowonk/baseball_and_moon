@@ -67,8 +67,7 @@ def prop_error(_df):
     )
 
 
-def do_phacking(merged, gid_stat_sums, phase=100):
-    stat_map = get_stat_map()
+def make_data_before_pivot(merged, gid_stat_sums, phase=100) -> pl.LazyFrame:
     data = merged.lazy()
     if phase == 100:
         data = data.with_columns(theflag=pl.col('full_moon_flag'))
@@ -76,15 +75,22 @@ def do_phacking(merged, gid_stat_sums, phase=100):
         data = data.with_columns(theflag=pl.col('new_moon_flag'))
     else:
         data = data.with_columns(theflag=pl.col('phase').is_between(phase - 0.5, phase + 0.5))
-    phack_data = (
+    return (
         data
         .lazy()
         .join(gid_stat_sums.lazy(), on='gid')
         .group_by('season', 'theflag')
         .agg(pl.col(COLUMNS).sum())
-        .collect()
-        .sort('season')
         .unpivot(index=['season', 'theflag', 'b_pa'], variable_name='stat')
+    )
+
+
+def do_phacking(merged, gid_stat_sums, phase=100):
+    stat_map = get_stat_map()
+
+    phack_data = (
+        make_data_before_pivot(merged, gid_stat_sums, phase)
+        .collect()
         .pivot(on=['theflag'], index=['season', 'stat'], values=['b_pa', 'value'])
         .with_columns(
             ratio_true=pl.col('value_true') / 'b_pa_true',
