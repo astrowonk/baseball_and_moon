@@ -1,9 +1,14 @@
-import polars as pl
-from uncertainties import ufloat
-import pandas as pd
 import math
-from tqdm.autonotebook import tqdm
+import os
 import random
+import re
+
+import pandas as pd
+import polars as pl
+from tqdm.autonotebook import tqdm
+from uncertainties import ufloat
+
+from blob_cache import blob_cache
 
 
 def rate_error(col, col_count):
@@ -21,9 +26,23 @@ def pipe_rate_error(_df: pl.LazyFrame | pl.DataFrame, col, col_count=None, out_n
 
 
 def make_fake_phase(_df: pl.LazyFrame, period: float = 26.7) -> pl.LazyFrame:
-    return _df.with_columns(
-        days_since=(pl.col('date') - pl.col('date').min()).dt.total_days()
-    ).with_columns(phase=100 * (0.5 + 0.5 * (math.pi * pl.col('days_since') / period).cos()))
+
+    new_data = (
+        (
+            pl
+            .DataFrame(pl.date_range(pl.date(1900, 1, 1), pl.date(2026, 1, 1), eager=True))
+            .lazy()
+            .with_columns(days_since=(pl.col('date') - pl.col('date').min()).dt.total_days())
+            .unique(subset=['date'])
+            .select(['date', 'days_since'])
+            .with_columns(
+                phase=100 * (0.5 + 0.5 * (math.pi * pl.col('days_since') / period).cos())
+            )
+        )
+        .sort('days_since')
+        .with_columns(full_moon_flag=pl.col('phase').peak_max())
+    )
+    return _df.drop(['phase', 'full_moon_flag']).join(new_data, on='date', how='left')
 
 
 def make_one_df_range(
@@ -34,6 +53,7 @@ def make_one_df_range(
     fake_moon_period=None,
     group_by=['Moon Status'],
     stat='large_victory',
+    max_full_moon=True,
 ):
     merged = _merged.lazy()
     if stat == 'large_victory':  # really should move stat creation out of this function
@@ -43,15 +63,18 @@ def make_one_df_range(
     return (
         merged
         .with_columns(
-            (pl.col('phase').is_between(phase, phase + range_size)).alias('Moon Status'),
-            #  team_quality_large_gap = (pl.col('py_win')-pl.col('py_win_home')).abs().gt(.10)
+            pl
+            .when(max_full_moon)
+            .then(pl.col('full_moon_flag'))
+            .otherwise(pl.col('phase').is_between(phase, phase + range_size))
+            .alias('Moon Status'),
         )
         .group_by(group_by, maintain_order=True)
         .agg(
             pl.col(stat).mean().alias(f'{stat}_rate'),
             pl.col('phase').mean(),
             pl.col('gid').count().alias('count'),
-            pl.col(stat).sum().alias(f'{stat}_count'),
+            pl.col(stat).sum().alias(f'{stat}_sum'),
             #    pl.col('daynight').eq('day').mean().alias('day_game_flag'),
         )
         .with_columns(blowout_threshold=threshold)
@@ -91,9 +114,10 @@ def make_phase_bin_data(
     merged,
     threshold=7,
     fake_moon_period=None,
-    phase_range=range(100),
+    phase_range=[99],
     range_size=1,
     stat='large_victory',
+    max_full_moon=True,
 ):
 
     phase_vs_all = (
@@ -106,6 +130,7 @@ def make_phase_bin_data(
                     range_size=range_size,
                     fake_moon_period=fake_moon_period,
                     stat=stat,
+                    max_full_moon=max_full_moon,
                 )
                 for phase in phase_range
             ]).pivot(on='Moon Status', index='phase_bin', values=[f'{stat}_rate', 'count'])
@@ -148,7 +173,14 @@ def make_moon(file='horizons_results.txt'):
     pandas_df = pd.read_table(file, sep=r'\s{4,}', parse_dates=True, engine='python')
     pandas_df.columns = ['date', 'phase']
     pandas_df['date'] = pd.to_datetime(pandas_df['date'])
-    return pl.from_pandas(pandas_df).with_columns(pl.col('date').dt.date())
+    return (
+        pl
+        .from_pandas(pandas_df)
+        .with_columns(pl.col('date').dt.date())
+        .with_columns(
+            full_moon_flag=pl.col('phase').peak_max(), new_moon_flag=pl.col('phase').peak_min()
+        )
+    )
 
 
 def get_merged_data():
@@ -157,10 +189,17 @@ def get_merged_data():
     return all_data.join(moon_data, how='left', on=['date'])
 
 
+@blob_cache(key='fake-moon-data2', keys_to_hash=['merged'])
 def make_fake_vs_real_full_moons(
-    merged, n=100, threshold=7, group=['Moon Status'], stat='large_victory'
+    merged,
+    n=100,
+    threshold=7,
+    group=['Moon Status'],
+    stat='large_victory',
+    max_full_moon=True,
 ):
     out = []
+
     for _ in tqdm(range(n)):
         random_period = random.randint(250000, 350000) / 10000
         out.append(
@@ -170,6 +209,7 @@ def make_fake_vs_real_full_moons(
                 threshold=threshold,
                 group_by=group,
                 stat=stat,
+                max_full_moon=max_full_moon,
             )
         )
     out.append(
@@ -181,7 +221,6 @@ def make_fake_vs_real_full_moons(
             threshold=7,
         )
     )
-    print(out[-1].columns)
     return (
         pl
         .concat(out)
@@ -194,4 +233,32 @@ def make_fake_vs_real_full_moons(
         )
         .with_columns(full_moon_ratio=pl.col('true') / 'false')
         .with_columns(pl.col('fake_moon_period').is_not_null().alias('fake moon'))
+    )
+
+
+def rename_for_gt(label):
+    if label == 'Moon Status':
+        return label
+    label_kind = label.split('_')[-1]
+    stat_name = '_'.join(label.split('_')[:-1])
+    match label_kind:
+        case 'count':
+            return 'Game Count'
+        case 'rate':
+            return clean_name(label)
+        case 'sum':
+            return f'{clean_name(stat_name)} Game Count'
+        case 'error':
+            return clean_name(label)
+
+
+def make_table(df, stat_name):
+    return (
+        df
+        .drop(['fake_moon_period', 'blowout_threshold', 'phase', 'phase_bin'], strict=False)
+        .sort('Moon Status')
+        .style.fmt_percent(columns=[f'{stat_name}_rate', f'{stat_name}_rate_error'])
+        .cols_label_with(fn=rename_for_gt)
+        .cols_move(f'{stat_name}_rate_error', after=f'{stat_name}_rate')
+        .tab_header(title=f'{clean_name(stat_name)} Full Moon Statistics')
     )

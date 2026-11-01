@@ -4,3 +4,5 @@
 *.csv
 *.csv
 *.zip
+*.parquet
+*.db
